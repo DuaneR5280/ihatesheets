@@ -1,0 +1,204 @@
+# MongoDB database
+import pymongo
+import tomllib
+from models import UserSwap, ExchangeDB
+import httpx
+from datetime import datetime
+import logging
+from rich.logging import RichHandler
+from rich import print
+from config import get_config
+
+# Init logging
+file_formatter = logging.Formatter("%(asctime)s [%(levelname)s]: %(message)s")
+file_handler = logging.FileHandler("./logs/database.log")
+file_handler.setFormatter(file_formatter)
+
+logging.basicConfig(
+    level="INFO",
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(rich_tracebacks=True), file_handler],
+)
+
+logger = logging.getLogger("rich")
+
+# Load config
+CONFIG = get_config()
+
+client = pymongo.MongoClient(CONFIG.databases["MONGO"])
+db = client[CONFIG.databases["MONGO_DB"]]
+swap_collection = db["swap"]
+etag_collection = db["etag"]
+
+def get_etag(etag):
+    """
+    Checks if a given etag exists in the etag collection.
+
+    Args:
+        etag (str): The etag to check.
+
+    Returns:
+        str: The etag if it exists, None otherwise.
+    """
+    doc = etag_collection.find_one({"etag": etag})
+    return bool(doc)
+
+
+def wipe_collection(collection_name):
+    """
+    Drops and recreates a collection in the database.
+
+    Args:
+        collection_name (str): The name of the collection to wipe.
+
+    Returns:
+        None
+    """
+    logger.warning(f"Dropping and recreating collection: {collection_name}")
+    collection = db[collection_name]
+    collection.drop()
+    logger.info(f"Collection {collection_name} dropped")
+    db.create_collection(collection_name)
+    logger.info(f"Collection {collection_name} created")
+
+
+def download_json():
+    """
+    Downloads the latest JSON from the SwapBot repository if it doesn't exist in the database.
+
+    etag is used to identify if the data has changed.
+    
+    Args:
+        None
+    
+    Returns:
+        ExchangeDB: The downloaded data if new, None if not.
+    """
+    json_url = CONFIG["databases"]["SWAPBOT"]
+    etag = httpx.head(json_url).headers["etag"]
+    etag_exists = get_etag(etag)
+    logger.info(f"etag: {etag}")
+    logger.info(f"etag exists: {etag_exists}")
+    if not etag_exists:
+        logger.info(f"Downloading JSON: {json_url}")
+        response = httpx.get(json_url)
+        response.raise_for_status()
+        data = response.json()
+        logger.info(f"JSON downloaded: {json_url}")
+        exchange_data = ExchangeDB(
+            etag=etag,
+            data_json=json_url,
+            last_updated=datetime.now(),
+            raw_json=data
+        )
+        logger.info(f"Inserting etag data: {exchange_data.dict()}")
+        etag_collection.insert_one(exchange_data.dict())
+        return exchange_data
+
+
+def create_user_docs(data: dict) -> dict:
+    """
+    Takes the raw data from the SwapBot repository and converts it into a list of dictionaries.
+
+    Args:
+        data (dict): The raw data from the SwapBot repository
+
+    Returns:
+        list[dict]: A list of dictionaries, one for each user in the data, containing the user's username and list of transactions.
+    """
+    docs = []
+    for user, details in data["reddit"].items():
+        user_doc = UserSwap(
+            username=user,
+            transactions=details["transactions"]
+        )
+        docs.append(user_doc.to_dict())
+    return docs
+
+
+def insert_data(user_docs: dict) -> None:
+    """
+    Insert data into the database
+
+    Args:
+        user_docs (dict): The UserSwap dict from the SwapBot repository
+
+    Returns:
+        None
+    """
+    try:
+        logger.info(f"Inserting {len(user_docs)} documents")
+        swap_collection.insert_many(user_docs)
+        logger.info("Data inserted successfully!")
+    except ValueError:
+        logger.info("No docs to insert...")
+
+
+def get_top_users():
+    """
+    Find the top 1% of users with the most transactions.
+
+    This function uses MongoDB's aggregation pipeline to unwind the transactions array,
+    group the results by username, and then sort the results by transaction count.
+
+    The top 1% of users are then returned as a list of dictionaries, each with a username
+    and a transaction count.
+
+    Returns:
+        list[dict]: A list of dictionaries with the top 1% of users with the most transactions.
+    """
+    pipeline = [
+        {"$unwind": "$transactions"},
+        {"$group": {"_id": "$username", "transaction_count": {"$sum": 1}}},
+        {"$sort": {"transaction_count": -1}}
+    ]
+
+    results = swap_collection.aggregate(pipeline)
+    transaction_counts = list(results)
+
+    total_users = swap_collection.count_documents({})
+    top_one_percent_count = int(total_users * 0.01)
+    top_users = transaction_counts[:top_one_percent_count]
+    return top_users
+
+def print_top_users(top_users):
+    """
+    Print the top 1% of users with the most transactions in the database.
+
+    The list of top users is generated by the get_top_users function and is a list of dictionaries
+    with a username and a transaction count. This function prints the top users in a formatted list,
+    with each entry showing the username and the number of transactions they have.
+
+    Parameters:
+        top_users (list[dict]): The list of dictionaries returned by the get_top_users function.
+
+    Returns:
+        None
+    """
+    line = "*" * 20
+    logger.info(f"{line} Top 1% of users with the most transactions {line}")
+    for i, user in enumerate(top_users):
+        user_link = f"https://www.reddit.com/user/{user['_id']}/"
+        logger.info(f"{[i]} {user['_id']}: {user['transaction_count']} - {user_link}")
+
+def check_for_update():
+    """
+    Check for updates and refresh the swap collection in the database.
+
+    This function downloads the latest JSON data, converts it into user documents,
+    wipes the existing swap collection, and inserts the new data if available.
+
+    Returns:
+        list[dict]: A list of user documents if new data is available, None otherwise.
+    """
+    json_data = download_json()
+    if json_data:
+        user_docs = create_user_docs(json_data.raw_json)
+        if user_docs:
+            wipe_collection("swap")
+            insert_data(user_docs)
+            return user_docs
+
+if __name__ == "__main__":
+    json_data = check_for_update()
