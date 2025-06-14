@@ -14,7 +14,7 @@ This is really just a learning and fun project. I wanted to learn about some new
 
 `2025-06-09`: This was taken from a larger project and is still being converted to a stand alone application.
 
-Learning:
+Technologies:
 
 - [Redis](https://redis.io/docs/latest/)
 - [msgspec](https://jcristharif.com/msgspec/)
